@@ -1,0 +1,150 @@
+import { describe, expect, it } from "vitest";
+import { RoomManager } from "../src/core/roomManager.js";
+
+describe("RoomManager", () => {
+  it("creates room, joins players, and starts game", () => {
+    const manager = new RoomManager();
+    const hostState = manager.createRoom("socket-host", "房主");
+    expect(hostState.roomCode).toHaveLength(6);
+    expect(hostState.players).toHaveLength(1);
+
+    const join1 = manager.joinRoom("socket-2", hostState.roomCode, "玩家A");
+    const join2 = manager.joinRoom("socket-3", hostState.roomCode, "玩家B");
+    expect(join1.players).toHaveLength(2);
+    expect(join2.players).toHaveLength(3);
+
+    const started = manager.startGameBySocket("socket-host");
+    expect(started.status).toBe("playing");
+    expect(started.gameState?.phase).toBe("speak");
+    expect(started.gameState?.round).toBe(1);
+  });
+
+  it("allows only current speaker to end turn", () => {
+    const manager = new RoomManager();
+    const host = manager.createRoom("host", "房主");
+    manager.joinRoom("p2", host.roomCode, "玩家A");
+    manager.joinRoom("p3", host.roomCode, "玩家B");
+    manager.startGameBySocket("host");
+
+    expect(() => manager.endTurnBySocket("p2")).toThrow("仅当前发言玩家可结束发言");
+
+    const state1 = manager.endTurnBySocket("host");
+    expect(state1.gameState?.phase).toBe("speak");
+    const speaker2Id = state1.gameState?.turnPlayerId;
+    const speaker2Socket = state1.players.find((p) => p.id === speaker2Id)?.nickname === "玩家A" ? "p2" : "p3";
+
+    const state2 = manager.endTurnBySocket(speaker2Socket);
+    expect(state2.gameState?.phase).toBe("speak");
+  });
+
+  it("progresses to vote phase and resolves votes", () => {
+    const manager = new RoomManager();
+    const host = manager.createRoom("host", "房主");
+    manager.joinRoom("p2", host.roomCode, "玩家A");
+    manager.joinRoom("p3", host.roomCode, "玩家B");
+    manager.startGameBySocket("host");
+
+    const first = manager.getPublicState(host.roomCode);
+    const firstSpeaker = first.gameState?.turnPlayerId;
+    const firstSpeakerSocket = first.players.find((p) => p.id === firstSpeaker)?.nickname === "房主" ? "host" : "p2";
+    manager.endTurnBySocket(firstSpeakerSocket);
+    const second = manager.getPublicState(host.roomCode);
+    const secondSpeaker = second.gameState?.turnPlayerId;
+    const secondSpeakerSocket = second.players.find((p) => p.id === secondSpeaker)?.nickname === "玩家A" ? "p2" : "p3";
+    manager.endTurnBySocket(secondSpeakerSocket);
+    const third = manager.getPublicState(host.roomCode);
+    const thirdSpeaker = third.gameState?.turnPlayerId;
+    const thirdSpeakerSocket = third.players.find((p) => p.id === thirdSpeaker)?.nickname === "玩家B" ? "p3" : "host";
+    const votePhaseState = manager.endTurnBySocket(thirdSpeakerSocket);
+    expect(votePhaseState.gameState?.phase).toBe("vote");
+
+    const current = manager.getPublicState(host.roomCode);
+    const targetId = current.players[0].id;
+
+    const vote1 = manager.voteBySocket("host", targetId);
+    const vote2 = manager.voteBySocket("p2", targetId);
+    const vote3 = manager.voteBySocket("p3", targetId);
+
+    expect(vote1.completed).toBe(false);
+    expect(vote2.completed).toBe(false);
+    expect(vote3.completed).toBe(true);
+    expect(vote3.state.gameState?.phase).toBe("result");
+  });
+
+  it("supports rematch ready flow and host start", () => {
+    const manager = new RoomManager();
+    const host = manager.createRoom("host", "房主");
+    manager.joinRoom("p2", host.roomCode, "玩家A");
+    manager.joinRoom("p3", host.roomCode, "玩家B");
+
+    const room = (manager as unknown as { rooms: Map<string, unknown> }).rooms.get(host.roomCode) as {
+      status: "waiting" | "playing" | "ended";
+      players: Array<{ rematchReady: boolean }>;
+    };
+    room.status = "ended";
+
+    manager.setRematchReadyBySocket("host", true);
+    manager.setRematchReadyBySocket("p2", true);
+    expect(() => manager.startRematchBySocket("host")).toThrow("请等待所有玩家准备完成");
+
+    manager.setRematchReadyBySocket("p3", true);
+    const rematchState = manager.startRematchBySocket("host");
+    expect(rematchState.status).toBe("playing");
+    expect(rematchState.players.every((player) => player.rematchReady === false)).toBe(true);
+  });
+
+  it("reassigns host when original host leaves", () => {
+    const manager = new RoomManager();
+    const host = manager.createRoom("host", "房主");
+    manager.joinRoom("p2", host.roomCode, "玩家A");
+    const stateAfterLeave = manager.leaveBySocket("host");
+    expect(stateAfterLeave).not.toBeNull();
+    expect(stateAfterLeave?.players).toHaveLength(1);
+    expect(stateAfterLeave?.players[0].isHost).toBe(true);
+  });
+
+  it("stores speaking history and clears on next round", () => {
+    const manager = new RoomManager();
+    const host = manager.createRoom("host", "房主");
+    manager.joinRoom("p2", host.roomCode, "玩家A");
+    manager.joinRoom("p3", host.roomCode, "玩家B");
+    manager.startGameBySocket("host");
+
+    const state = manager.getPublicState(host.roomCode);
+    const currentSpeakerId = state.gameState?.turnPlayerId;
+    const currentSpeakerNickname = state.players.find((p) => p.id === currentSpeakerId)?.nickname;
+    const currentSpeakerSocket = currentSpeakerNickname === "房主" ? "host" : currentSpeakerNickname === "玩家A" ? "p2" : "p3";
+    const nonSpeakerSocket = ["host", "p2", "p3"].find((socketId) => socketId !== currentSpeakerSocket) ?? "p2";
+
+    const afterStatement = manager.submitStatementBySocket(currentSpeakerSocket, "像一种常见饮料");
+    expect(afterStatement.gameState?.speakingHistory).toHaveLength(1);
+    expect(afterStatement.gameState?.speakingHistory[0].text).toBe("像一种常见饮料");
+    expect(() => manager.submitStatementBySocket(nonSpeakerSocket, "越权发言")).toThrow();
+
+    const s1 = manager.getPublicState(host.roomCode);
+    const sp1 = s1.gameState?.turnPlayerId;
+    const sk1 = s1.players.find((p) => p.id === sp1)?.nickname === "房主" ? "host" : s1.players.find((p) => p.id === sp1)?.nickname === "玩家A" ? "p2" : "p3";
+    manager.endTurnBySocket(sk1);
+    const s2 = manager.getPublicState(host.roomCode);
+    const sp2 = s2.gameState?.turnPlayerId;
+    const sk2 = s2.players.find((p) => p.id === sp2)?.nickname === "房主" ? "host" : s2.players.find((p) => p.id === sp2)?.nickname === "玩家A" ? "p2" : "p3";
+    manager.endTurnBySocket(sk2);
+    const s3 = manager.getPublicState(host.roomCode);
+    const sp3 = s3.gameState?.turnPlayerId;
+    const sk3 = s3.players.find((p) => p.id === sp3)?.nickname === "房主" ? "host" : s3.players.find((p) => p.id === sp3)?.nickname === "玩家A" ? "p2" : "p3";
+    manager.endTurnBySocket(sk3);
+
+    const votedState = manager.getPublicState(host.roomCode);
+    const targetId = votedState.players[0].id;
+    manager.voteBySocket("host", targetId);
+    manager.voteBySocket("p2", targetId);
+    manager.voteBySocket("p3", targetId);
+
+    const resultState = manager.getPublicState(host.roomCode);
+    if (resultState.status !== "ended") {
+      const next = manager.nextPhaseBySocket("host");
+      expect(next.gameState?.phase).toBe("speak");
+      expect(next.gameState?.speakingHistory).toHaveLength(0);
+    }
+  });
+});
